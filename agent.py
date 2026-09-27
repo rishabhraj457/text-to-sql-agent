@@ -5,73 +5,21 @@ from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_agent
-from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
 from rich.console import Console
 from rich.panel import Panel
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # Load environment variables
 load_dotenv()
 
 console = Console()
 
-# System prompt for the SQL agent
-SYSTEM_PROMPT = """
-You are an agent designed to interact with a SQL database.
-Given an input question, create a syntactically correct {dialect} query to run,
-then look at the results of the query and return the answer. Unless the user
-specifies a specific number of examples they wish to obtain, always limit your
-query to at most {top_k} results.
-
-You can order the results by a relevant column to return the most interesting
-examples in the database. Never query for all the columns from a specific table,
-only ask for the relevant columns given the question.
-
-You MUST double check your query before executing it. If you get an error while
-executing a query, rewrite the query and try again.
-
-DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the
-database.
-
-To start you should ALWAYS look at the tables in the database to see what you
-can query. Do NOT skip this step.
-
-Then you should query the schema of the most relevant tables.
-"""
-
-def create_sql_agent():
-    """Create and return a text-to-SQL agent"""
-
-    # Connect to Chinook database
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chinook.db")
-    db = SQLDatabase.from_uri(
-        f"sqlite:///{db_path}",
-        sample_rows_in_table_info=3
-    )
-
-    # Initialize Claude Sonnet 4.5
-    model = ChatAnthropic(
-        model="claude-sonnet-4-5-20250929",
-        temperature=0
-    )
-
-    # Create SQL toolkit with tools
-    toolkit = SQLDatabaseToolkit(db=db, llm=model)
-    tools = toolkit.get_tools()
-
-    # Create the agent
-    agent = create_agent(
-        model,
-        tools,
-        system_prompt=SYSTEM_PROMPT.format(dialect=db.dialect, top_k=5)
-    )
-
-    return agent
-
-
 def main():
     """Main entry point for the SQL Agent CLI"""
     parser = argparse.ArgumentParser(
-        description="Text-to-SQL Agent powered by LangChain and Claude Sonnet 4.5",
+        description="Text-to-SQL Agent powered by LangChain and open-source models",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -95,22 +43,58 @@ Examples:
     ))
     console.print()
 
-    # Create the agent
-    console.print("[dim]Creating SQL Agent...[/dim]")
-    agent = create_sql_agent()
+    # Connect to Chinook database
+    console.print("[dim]Connecting to database...[/dim]")
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chinook.db")
+    db = SQLDatabase.from_uri(
+        f"sqlite:///{db_path}",
+        sample_rows_in_table_info=3
+    )
 
-    # Invoke the agent
-    console.print("[dim]Processing query...[/dim]\n")
+    # Initialize Llama 3 on Groq
+    model = ChatGroq(
+        model="qwen/qwen3.8-27b",
+        temperature=0
+    )
 
+    console.print("[dim]Generating SQL query...[/dim]")
+    
     try:
-        result = agent.invoke({
-            "messages": [{"role": "user", "content": args.question}]
-        })
+        # Get database schema
+        schema = db.get_table_info()
+        
+        # 1. Generate the SQL query
+        sql_prompt = f"""You are a SQLite expert. Given the database schema below, write a syntactically correct SQLite query to answer the user's question.
+Unless the user specifies a number of examples, limit your query to at most 5 results using LIMIT.
+Return ONLY the SQL query, without any markdown formatting or explanation.
 
-        # Extract and display the final answer
-        final_message = result["messages"][-1]
-        answer = final_message.content if hasattr(final_message, 'content') else str(final_message)
+Schema:
+{schema}
 
+Question: {args.question}
+SQL Query:"""
+
+        sql_response = model.invoke(sql_prompt)
+        sql_query = sql_response.content.strip()
+        
+        # Clean markdown formatting if present
+        if "```sql" in sql_query:
+            sql_query = sql_query.split("```sql")[1].split("```")[0].strip()
+        elif "```" in sql_query:
+            sql_query = sql_query.split("```")[1].strip()
+            
+        console.print(f"[dim]Executing:[/dim] [cyan]{sql_query}[/cyan]\n")
+        
+        # Execute the SQL query
+        result = db.run(sql_query)
+        
+        # 3. Formulate the final answer using the model
+        final_prompt = f"Given the following user question, corresponding SQL query, and SQL result, answer the user question directly and concisely.\n\nQuestion: {args.question}\nSQL Query: {sql_query}\nSQL Result: {result}\n\nAnswer:"
+        
+        answer_msg = model.invoke(final_prompt)
+        answer = answer_msg.content if hasattr(answer_msg, 'content') else str(answer_msg)
+        
+        # Display the result
         console.print(Panel(
             f"[bold green]Answer:[/bold green]\n\n{answer}",
             border_style="green"

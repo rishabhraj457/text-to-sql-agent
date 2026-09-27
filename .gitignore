@@ -2,7 +2,7 @@
 .env
 
 # Database
-chinook.db
+# chinook.db
 
 # Virtual environment
 .venv/
